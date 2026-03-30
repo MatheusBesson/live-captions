@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.audio.device_detector import AudioDevice, list_input_devices
+from audio.device_detector import AudioDevice, list_system_devices, list_microphone_devices
 from config import BLACKHOLE_BREW, BLACKHOLE_URL
 
 
@@ -39,7 +39,8 @@ class OnboardingWindow(QWidget):
     def __init__(self):
         super().__init__()
         self._system = platform.system()
-        self._devices: list[AudioDevice] = list_input_devices()
+        self._devices: list[AudioDevice] = []
+        self._confirm_btn: QPushButton | None = None   # inicializa antes de _setup_ui
         self._setup_ui()
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -121,20 +122,14 @@ class OnboardingWindow(QWidget):
         root.addWidget(sep)
 
         # Seleção manual
-        manual_label = QLabel("Ou selecione um dispositivo manualmente:")
+        manual_label = QLabel("Selecione o dispositivo de saída de áudio (fones/alto-falantes):")
         manual_label.setStyleSheet("color: #aaa; font-size: 12px;")
         root.addWidget(manual_label)
 
         self._combo = QComboBox()
-        if self._devices:
-            for dev in self._devices:
-                self._combo.addItem(dev.name, dev)
-        else:
-            self._combo.addItem("Nenhum dispositivo encontrado")
-            self._combo.setEnabled(False)
         root.addWidget(self._combo)
 
-        # Botões
+        # Botões — criados ANTES de _populate_combo para evitar AttributeError
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
 
@@ -144,34 +139,35 @@ class OnboardingWindow(QWidget):
 
         btn_row.addStretch()
 
-        confirm_btn = QPushButton("Confirmar e iniciar")
-        confirm_btn.clicked.connect(self._confirm)
-        confirm_btn.setEnabled(bool(self._devices))
-        self._confirm_btn = confirm_btn
-        btn_row.addWidget(confirm_btn)
+        self._confirm_btn = QPushButton("Confirmar e iniciar")
+        self._confirm_btn.clicked.connect(self._confirm)
+        btn_row.addWidget(self._confirm_btn)
 
         root.addLayout(btn_row)
 
+        # Popula o combo agora que _confirm_btn já existe
+        self._devices = list_system_devices()
+        self._populate_combo()
+
     def _build_windows_instructions(self, layout: QVBoxLayout):
         layout.addWidget(self._info_label(
-            "O dispositivo WASAPI Loopback não foi detectado automaticamente."
+            "Nenhum dispositivo de áudio do sistema foi detectado."
         ))
         layout.addWidget(self._info_label(
-            "Para capturar o áudio do sistema no Windows, habilite o Stereo Mix:"
+            "Verifique se o pyaudiowpatch está instalado no ambiente da UI:"
         ))
 
-        steps = [
-            "1. Clique com o botão direito no ícone de som na barra de tarefas",
-            "2. Abra 'Configurações de som' → 'Mais configurações de som'",
-            "3. Vá na aba 'Gravação'",
-            "4. Clique com o botão direito em uma área vazia → 'Mostrar dispositivos desativados'",
-            "5. Habilite o 'Stereo Mix' e clique em OK",
-            "6. Clique em 'Atualizar lista' abaixo",
-        ]
-        for step in steps:
-            lbl = QLabel(step)
-            lbl.setStyleSheet("color: #bbb; font-size: 12px; padding-left: 8px;")
-            layout.addWidget(lbl)
+        cmd_label = QLabel("  > pip install pyaudiowpatch")
+        cmd_label.setStyleSheet(
+            "font-family: monospace; background: #1a1a1a; color: #7dd3a8;"
+            "padding: 8px 12px; border-radius: 6px; font-size: 12px;"
+        )
+        layout.addWidget(cmd_label)
+
+        layout.addWidget(self._info_label(
+            "Após instalar, feche o app e abra novamente — o dispositivo será "
+            "detectado automaticamente. Ou selecione manualmente abaixo."
+        ))
 
     def _build_macos_instructions(self, layout: QVBoxLayout):
         layout.addWidget(self._info_label(
@@ -208,18 +204,21 @@ class OnboardingWindow(QWidget):
         lbl.setStyleSheet("color: #ccc; font-size: 13px;")
         return lbl
 
-    def _refresh_devices(self):
-        self._devices = list_input_devices()
+    def _populate_combo(self):
         self._combo.clear()
         if self._devices:
             for dev in self._devices:
-                self._combo.addItem(dev.name, dev)
+                self._combo.addItem(f"{dev.name}  ({dev.native_sample_rate}Hz)", dev)
             self._combo.setEnabled(True)
             self._confirm_btn.setEnabled(True)
         else:
             self._combo.addItem("Nenhum dispositivo encontrado")
             self._combo.setEnabled(False)
             self._confirm_btn.setEnabled(False)
+
+    def _refresh_devices(self):
+        self._devices = list_system_devices()
+        self._populate_combo()
 
     def _confirm(self):
         device: AudioDevice = self._combo.currentData()

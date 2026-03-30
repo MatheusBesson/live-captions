@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
 import requests
 
 from app.audio.capture import AudioCapture
-from app.audio.device_detector import AudioDevice
+from app.audio.device_detector import AudioDevice, CaptureMode, detect_microphone
 from app.config import SUPPORTED_LANGUAGES, API_TRANSCRIBE
 
 
@@ -160,6 +160,18 @@ class OverlayWindow(QWidget):
 
         top_bar.addStretch()
 
+        # Botão alternar fonte de áudio (sistema ↔ microfone)
+        self._source_btn = QPushButton("🔊 sistema")
+        self._source_btn.setToolTip("Alternar entre áudio do sistema e microfone")
+        self._source_btn.setStyleSheet(
+            "QPushButton { background: rgba(255,255,255,0.06); border: 1px solid "
+            "rgba(255,255,255,0.12); border-radius: 6px; color: #aaa; font-size: 11px; "
+            "padding: 3px 10px; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.12); color: #fff; }"
+        )
+        self._source_btn.clicked.connect(self._toggle_source)
+        top_bar.addWidget(self._source_btn)
+
         # Seletor de idioma alvo
         lang_hint = QLabel("traduzir para:")
         lang_hint.setStyleSheet("color: #555; font-size: 11px;")
@@ -219,13 +231,42 @@ class OverlayWindow(QWidget):
         self._worker.error_occurred.connect(self._on_error)
         self._thread.start()
 
-        # Captura de áudio — chama _on_audio_chunk a cada CHUNK_DURATION segundos
-        self._capture = AudioCapture(
-            device=self._device, #device_index=self._device.index
-            on_chunk=self._on_audio_chunk,
-        )
-        self._capture.start()
-        self._set_status("● ouvindo", "#3a9e6a")
+        self._start_capture(self._device)
+
+    def _start_capture(self, device: AudioDevice):
+        """Inicia (ou reinicia) a captura com o dispositivo informado."""
+        if self._capture and self._capture.is_running:
+            self._capture.stop()
+
+        mode_label = "sistema" if device.mode == CaptureMode.SYSTEM else "microfone"
+        self._source_btn.setText(f"{'🔊' if device.mode == CaptureMode.SYSTEM else '🎤'} {mode_label}")
+
+        self._capture = AudioCapture(device=device, on_chunk=self._on_audio_chunk)
+        try:
+            self._capture.start()
+            self._set_status("● ouvindo", "#3a9e6a")
+        except Exception as e:
+            self._set_status("⚠ erro no áudio", "#e05a5a")
+            self._caption_main.setText(f"Erro ao abrir dispositivo: {e}")
+
+    def _toggle_source(self):
+        """Alterna entre áudio do sistema e microfone."""
+        if self._device.mode == CaptureMode.SYSTEM:
+            mic = detect_microphone()
+            if mic:
+                self._device = mic
+                self._start_capture(mic)
+            else:
+                self._caption_main.setText("Nenhum microfone encontrado.")
+        else:
+            # Volta para o dispositivo de sistema original
+            from audio.device_detector import detect_system_audio
+            sys_dev = detect_system_audio()
+            if sys_dev:
+                self._device = sys_dev
+                self._start_capture(sys_dev)
+            else:
+                self._caption_main.setText("Dispositivo de sistema não encontrado.")
 
     def _on_audio_chunk(self, audio_b64: str):
         """Chamado pela thread de áudio — repassa ao worker via Qt signal."""

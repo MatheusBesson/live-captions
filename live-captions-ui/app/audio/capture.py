@@ -1,17 +1,17 @@
 """
-Captura contínua de áudio do dispositivo de sistema selecionado.
+Captura contínua de áudio — sistema (loopback) ou microfone.
 
-Roda em thread separada para não bloquear a UI.
-A cada CHUNK_DURATION segundos, chama on_chunk(audio_b64).
+Windows sistema  → pyaudiowpatch (WASAPI loopback nativo)
+Windows microfone→ sounddevice (dispositivo de entrada padrão)
+macOS sistema    → sounddevice + BlackHole
+macOS microfone  → sounddevice
 
-Resample automático:
-  O dispositivo pode capturar em qualquer frequência (48000Hz, 44100Hz, 96000Hz...).
-  Este módulo detecta a frequência nativa, captura nela e faz resample para
-  16000Hz (exigido pelo Whisper) antes de enviar ao backend.
-  O usuário não precisa configurar nada.
+Resample automático: captura na taxa nativa do hardware e converte
+para 16000Hz antes de enviar ao Whisper.
 """
 
 import base64
+import platform
 import queue
 import threading
 import logging
@@ -21,48 +21,42 @@ from typing import Callable
 import numpy as np
 from scipy.signal import resample_poly
 
-import sounddevice as sd
-
-from app.config import BLOCKSIZE, CHUNK_DURATION, WHISPER_SAMPLE_RATE
-from app.audio.device_detector import AudioDevice
+from app.config import CHUNK_DURATION, WHISPER_SAMPLE_RATE
+from app.audio.device_detector import AudioDevice, CaptureMode
 
 logger = logging.getLogger(__name__)
+
+BLOCKSIZE = 1024   # frames por callback
 
 
 class AudioCapture:
     def __init__(self, device: AudioDevice, on_chunk: Callable[[str], None]):
-        """
-        device    : AudioDevice com index e native_sample_rate detectados
-        on_chunk  : callback chamado com o áudio em base64 (PCM float32, 16kHz)
-                    já pronto para enviar ao backend
-        """
-        self._device = device
-        self._on_chunk = on_chunk
-
-        # Taxa nativa do hardware (ex: 48000Hz)
+        self._device      = device
+        self._on_chunk    = on_chunk
         self._capture_rate = device.native_sample_rate
-        # Taxa alvo do Whisper (16000Hz)
-        self._target_rate = WHISPER_SAMPLE_RATE
+        self._target_rate  = WHISPER_SAMPLE_RATE
 
-        # Fator de resample calculado pelo MDC para máxima precisão numérica
-        _g = gcd(self._target_rate, self._capture_rate)
-        self._resample_up   = self._target_rate  // _g
-        self._resample_down = self._capture_rate // _g
+        _g          = gcd(self._target_rate, self._capture_rate)
+        self._up    = self._target_rate  // _g
+        self._down  = self._capture_rate // _g
         self._needs_resample = (self._capture_rate != self._target_rate)
 
-        # Samples na taxa nativa que equivalem a CHUNK_DURATION segundos
-        self._chunk_samples_native = self._capture_rate * CHUNK_DURATION
+        self._chunk_samples = self._capture_rate * CHUNK_DURATION
 
-        self._queue: queue.Queue = queue.Queue()
-        self._buffer: list[np.ndarray] = []
-        self._stream: sd.InputStream | None = None
-        self._running = False
-        self._thread: threading.Thread | None = None
+        self._queue:   queue.Queue              = queue.Queue()
+        self._buffer:  list[np.ndarray]          = []
+        self._running: bool                      = False
+        self._thread:  threading.Thread | None   = None
+        self._actual_channels: int               = self._device.channels
+
+        # Handles específicos por backend
+        self._pa_stream = None   # pyaudiowpatch
+        self._sd_stream = None   # sounddevice
 
         logger.info(
-            f"[AudioCapture] {device.name} | "
-            f"nativo: {self._capture_rate}Hz → Whisper: {self._target_rate}Hz | "
-            f"resample: {'sim ({}/{}x)'.format(self._resample_up, self._resample_down) if self._needs_resample else 'não necessário'}"
+            f"[AudioCapture] '{device.name}' | "
+            f"loopback={device.is_loopback} | "
+            f"{self._capture_rate}Hz → {self._target_rate}Hz"
         )
 
     # ── Controle ──────────────────────────────────────────────────────────────
@@ -73,79 +67,163 @@ class AudioCapture:
         self._running = True
         self._buffer.clear()
 
-        self._stream = sd.InputStream(
-            device=self._device.index,
-            samplerate=self._capture_rate,   # captura na frequência NATIVA do hardware
-            channels=self._device.channels,
-            dtype="float32",
-            blocksize=BLOCKSIZE,
-            callback=self._sd_callback,
+        use_pyaudio = (
+            platform.system() == "Windows"
+            and self._device.mode == CaptureMode.SYSTEM
+            and self._device.is_loopback
         )
-        self._stream.start()
+
+        if use_pyaudio:
+            self._start_pyaudio_loopback()
+        else:
+            self._start_sounddevice()
 
         self._thread = threading.Thread(target=self._process_loop, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._running = False
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        if self._pa_stream:
+            try:
+                self._pa_stream.stop_stream()
+                self._pa_stream.close()
+                self._pa.terminate()
+            except Exception:
+                pass
+            self._pa_stream = None
+        if self._sd_stream:
+            try:
+                self._sd_stream.stop()
+                self._sd_stream.close()
+            except Exception:
+                pass
+            self._sd_stream = None
 
     @property
     def is_running(self) -> bool:
         return self._running
 
-    # ── Internals ─────────────────────────────────────────────────────────────
+    # ── pyaudiowpatch — WASAPI loopback (Windows sistema) ────────────────────
 
-    def _sd_callback(self, indata: np.ndarray, frames: int, time, status):
-        if status:
-            logger.warning(f"[AudioCapture] status sounddevice: {status}")
-        self._queue.put(indata.copy())
+    def _start_pyaudio_loopback(self):
+        try:
+            import pyaudiowpatch as pyaudio
+        except ImportError:
+            raise RuntimeError(
+                "pyaudiowpatch não instalado.\n"
+                "Execute: pip install pyaudiowpatch"
+            )
+
+        self._pa = pyaudio.PyAudio()
+
+        # Ordem de tentativa: valor reportado → 2 → 1
+        reported = self._device.channels
+        candidates = []
+        if reported > 0:
+            candidates.append(reported)
+        for fallback in (2, 1):
+            if fallback not in candidates:
+                candidates.append(fallback)
+
+        last_error = None
+        for ch in candidates:
+            try:
+                logger.info(f"[AudioCapture] Tentando abrir loopback com {ch} canal(is)...")
+
+                # Captura o valor de ch no closure
+                _ch = ch
+
+                def _pa_callback(in_data, frame_count, time_info, status,
+                                  _channels=_ch):
+                    if self._running and in_data:
+                        audio = np.frombuffer(in_data, dtype=np.float32).copy()
+                        self._queue.put((audio, _channels))
+                    return (None, pyaudio.paContinue)
+
+                self._pa_stream = self._pa.open(
+                    format=pyaudio.paFloat32,
+                    channels=ch,
+                    rate=self._capture_rate,
+                    frames_per_buffer=BLOCKSIZE,
+                    input=True,
+                    input_device_index=self._device.index,
+                    stream_callback=_pa_callback,
+                )
+                self._pa_stream.start_stream()
+                self._actual_channels = ch
+                logger.info(f"[AudioCapture] Loopback iniciado com {ch} canal(is)")
+                return
+
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[AudioCapture] Falha com {ch} canal(is): {e}")
+
+        raise RuntimeError(
+            f"Não foi possível abrir o dispositivo de loopback "
+            f"'{self._device.name}': {last_error}"
+        )
+        self._pa_stream.start_stream()
+        logger.info("[AudioCapture] pyaudiowpatch loopback iniciado")
+
+    # ── sounddevice — microfone ou BlackHole (macOS) ──────────────────────────
+
+    def _start_sounddevice(self):
+        import sounddevice as sd
+
+        def _sd_callback(indata, frames, time, status):
+            if status:
+                logger.warning(f"[AudioCapture] {status}")
+            self._queue.put((indata.copy(), self._device.channels))
+
+        self._sd_stream = sd.InputStream(
+            device=self._device.index,
+            samplerate=self._capture_rate,
+            channels=self._device.channels,
+            dtype="float32",
+            blocksize=BLOCKSIZE,
+            callback=_sd_callback,
+        )
+        self._sd_stream.start()
+        self._actual_channels = self._device.channels
+        logger.info("[AudioCapture] sounddevice stream iniciado")
+
+    # ── Loop de processamento comum ───────────────────────────────────────────
 
     def _process_loop(self):
         while self._running:
             try:
-                block = self._queue.get(timeout=0.5)
+                item = self._queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
-            # Mixagem para mono se o dispositivo capturou em stereo
-            if block.ndim > 1 and block.shape[1] > 1:
-                block = block.mean(axis=1)
-            else:
-                block = block.flatten()
+            # Desempacota (audio_array, channel_count)
+            block, ch = item
+            block = np.asarray(block, dtype=np.float32).flatten()
+
+            # Mixagem para mono usando o número real de canais
+            if ch > 1 and len(block) % ch == 0:
+                block = block.reshape(-1, ch).mean(axis=1)
 
             self._buffer.append(block)
             total = sum(b.shape[0] for b in self._buffer)
 
-            if total < self._chunk_samples_native:
+            if total < self._chunk_samples:
                 continue
 
-            # Chunk completo — processa e zera o buffer
-            audio_native = np.concatenate(self._buffer)[:self._chunk_samples_native]
+            # Chunk completo — processa e reseta buffer
+            audio = np.concatenate(self._buffer)[:self._chunk_samples]
             self._buffer = []
 
-            # ── Resample: frequência nativa → 16000Hz ─────────────────────────
+            # Resample para 16000Hz
             if self._needs_resample:
-                audio_16k = resample_poly(
-                    audio_native,
-                    up=self._resample_up,
-                    down=self._resample_down,
-                ).astype(np.float32)
-            else:
-                audio_16k = audio_native.astype(np.float32)
+                audio = resample_poly(audio, self._up, self._down).astype(np.float32)
 
-            # Normaliza amplitude para [-1.0, 1.0] — range esperado pelo Whisper
-            peak = np.abs(audio_16k).max()
+            # Normaliza amplitude para [-1, 1]
+            peak = np.abs(audio).max()
             if peak > 1.0:
-                audio_16k /= peak
+                audio /= peak
 
-            print(f"[Audio] max: {audio_16k.max()} | min: {audio_16k.min()} | peak: {peak}")
-
-            # Encode base64 e dispara callback
-            audio_b64 = base64.b64encode(audio_16k.tobytes()).decode("utf-8")
+            audio_b64 = base64.b64encode(audio.tobytes()).decode("utf-8")
             try:
                 self._on_chunk(audio_b64)
             except Exception as e:
