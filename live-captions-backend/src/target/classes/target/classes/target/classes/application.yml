@@ -1,0 +1,28 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: live-captions-backend
+
+# Endereço do microsserviço FastAPI
+# Em produção: substitua por https://ai.seuapp.com
+ai:
+  service:
+    url: http://localhost:8001
+    timeout-seconds: 15
+
+# Actuator — expõe apenas health check por segurança
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.livecaptions: DEBUG
+    org.springframework.web: INFO
