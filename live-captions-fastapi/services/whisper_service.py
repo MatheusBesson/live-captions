@@ -3,10 +3,18 @@ Integração com faster-whisper para transcrição de áudio.
 
 O modelo é carregado uma única vez na inicialização do FastAPI
 e mantido em memória para evitar delay nas requisições seguintes.
+
+CORREÇÕES aplicadas:
+  - VAD menos agressivo: threshold reduzido para não descartar áudio de sistema
+    (loopback WASAPI tende a ter amplitude mais baixa que microfone).
+  - Log de diagnóstico de amplitude: avisa quando o sinal é suspeito de silêncio
+    genuíno vs. sinal presente mas descartado pelo VAD.
+  - vad_filter=False como fallback quando todos os segmentos são removidos:
+    re-transcreve sem VAD para confirmar se há conteúdo.
+  - min_speech_duration_ms reduzido para capturar trechos curtos.
 """
 
 import base64
-import io
 import logging
 import time
 from dataclasses import dataclass
@@ -15,8 +23,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# faster-whisper é importado com lazy loading para não quebrar
-# o servidor caso o modelo ainda não tenha sido baixado
 try:
     from faster_whisper import WhisperModel
     WHISPER_AVAILABLE = True
@@ -32,11 +38,17 @@ class TranscriptionResult:
     duration: float
 
 
+# Amplitude RMS mínima para considerar que há sinal de áudio real.
+# Abaixo disto o chunk é silêncio genuíno e não vale enviar ao Whisper.
+# WASAPI loopback em silêncio gera ~1e-7; fala real fica acima de 1e-3.
+_MIN_RMS = 5e-4
+
+
 class WhisperService:
     """
     Wrapper do faster-whisper.
 
-    Modelo padrão: "small" (~244MB, boa velocidade/precisão para prototipagem)
+    Modelo padrão: "small" (~244MB, boa velocidade/precisão para prototipagem).
     Para mais precisão use "medium" — mais lento, ~769MB.
     """
 
@@ -46,11 +58,6 @@ class WhisperService:
         self._device = device
 
     def load(self):
-        """
-        Carrega o modelo em memória.
-        Chamado uma vez na inicialização do FastAPI (startup event).
-        O download do modelo ocorre automaticamente na primeira execução (~244MB).
-        """
         if not WHISPER_AVAILABLE:
             logger.warning("[WhisperService] faster-whisper indisponível — modo stub ativo")
             return
@@ -60,48 +67,88 @@ class WhisperService:
         self._model = WhisperModel(
             self._model_size,
             device=self._device,
-            compute_type="int8",        # int8 reduz uso de memória sem perda significativa
+            compute_type="int8",
         )
         elapsed = time.time() - start
         logger.info(f"[WhisperService] Modelo carregado em {elapsed:.1f}s")
 
     def transcribe(self, audio_b64: str, sample_rate: int = 16000) -> TranscriptionResult:
         """
-        Transcreve áudio recebido em base64.
+        Transcreve áudio recebido em base64 (PCM float32, mono, 16kHz).
 
-        O áudio deve estar em formato PCM float32, mono, 16kHz
-        (exatamente como enviado pela captura do sounddevice).
+        Pipeline:
+          1. Decodifica base64 → numpy float32
+          2. Verifica RMS — se silêncio genuíno, retorna "" imediatamente
+          3. Transcreve com VAD ligado
+          4. Se VAD removeu tudo mas havia sinal, re-transcreve sem VAD
         """
         if self._model is None:
-            # Modo stub — retorna texto fictício para testes sem modelo
-            logger.debug("[WhisperService] Stub: retornando transcrição fictícia")
             return TranscriptionResult(
                 text="[modelo não carregado — instale faster-whisper]",
                 language="pt",
                 duration=3.0,
             )
 
-        # Decodifica base64 → numpy array float32
+        # 1. Decodifica
         audio_bytes = base64.b64decode(audio_b64)
-        audio_np = np.frombuffer(audio_bytes, dtype=np.float32)
+        audio_np = np.frombuffer(audio_bytes, dtype=np.float32).copy()
 
-        # Normaliza amplitude para evitar distorção
-        if audio_np.max() > 1.0:
-            audio_np = audio_np / audio_np.max()
+        if len(audio_np) == 0:
+            logger.warning("[WhisperService] Chunk vazio recebido")
+            return TranscriptionResult(text="", language="pt", duration=0.0)
 
-        logger.debug(f"[WhisperService] Transcrevendo {len(audio_np)/sample_rate:.1f}s de áudio")
+        # Normaliza amplitude se necessário (clipping)
+        peak = float(np.abs(audio_np).max())
+        if peak > 1.0:
+            audio_np = audio_np / peak
 
-        segments, info = self._model.transcribe(
-            audio_np,
+        # 2. Verificação de silêncio por RMS
+        rms = float(np.sqrt(np.mean(audio_np ** 2)))
+        duration_s = len(audio_np) / sample_rate
+        logger.debug(f"[WhisperService] Chunk {duration_s:.1f}s | RMS={rms:.2e} | peak={peak:.4f}")
+
+        if rms < _MIN_RMS:
+            logger.debug(f"[WhisperService] Silêncio genuíno (RMS={rms:.2e} < {_MIN_RMS:.2e}) — ignorando")
+            return TranscriptionResult(text="", language="pt", duration=duration_s)
+
+        # 3. Transcrição com VAD
+        result = self._run_transcribe(audio_np, use_vad=True)
+
+        # 4. Fallback sem VAD se havia sinal mas VAD removeu tudo
+        if not result.text and rms >= _MIN_RMS * 10:
+            logger.info(
+                f"[WhisperService] VAD removeu áudio com sinal (RMS={rms:.2e}) — "
+                f"re-transcrevendo sem VAD"
+            )
+            result = self._run_transcribe(audio_np, use_vad=False)
+
+        if result.text:
+            logger.info(f"[WhisperService] ✓ '{result.text[:80]}'  [{result.language}]")
+        else:
+            logger.debug(f"[WhisperService] Chunk sem fala detectada (RMS={rms:.2e})")
+
+        return result
+
+    def _run_transcribe(self, audio_np: np.ndarray, use_vad: bool) -> TranscriptionResult:
+        """Executa a transcrição com ou sem filtro VAD."""
+        kwargs = dict(
             beam_size=5,
-            language=None,          # None = detecção automática de idioma
-            vad_filter=True,        # remove silêncio para economizar processamento
-            vad_parameters=dict(
-                min_silence_duration_ms=500,
-            ),
+            language=None,          # detecção automática
+            vad_filter=use_vad,
         )
 
-        # Consome o gerador de segments
+        if use_vad:
+            kwargs["vad_parameters"] = dict(
+                # Padrão do faster-whisper é 0.5 — reduzimos para não
+                # descartar fala real de baixa amplitude (áudio de sistema).
+                threshold=0.3,
+                min_speech_duration_ms=100,   # captura trechos curtos
+                min_silence_duration_ms=500,
+                speech_pad_ms=200,
+            )
+
+        segments, info = self._model.transcribe(audio_np, **kwargs)
+
         text_parts = [seg.text.strip() for seg in segments]
         full_text = " ".join(text_parts).strip()
 
@@ -112,5 +159,5 @@ class WhisperService:
         )
 
 
-# Instância singleton — compartilhada pelos routers via injeção
+# Instância singleton
 whisper_service = WhisperService(model_size="small", device="cpu")

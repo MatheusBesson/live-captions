@@ -7,13 +7,26 @@ Características:
 - Exibe legenda original (cinza) e traduzida (branca)
 - Seletor de idioma alvo embutido
 - Botão de pausa e configurações
+
+CORREÇÕES aplicadas:
+  - TranscribeWorker agora usa um slot Qt conectado via signal (process_chunk),
+    garantindo que requests.post rode SEMPRE na thread do worker, nunca na thread
+    de áudio. Antes o transcribe() era chamado direto da thread de áudio.
+  - Fila de chunks com tamanho máximo 1: se o backend ainda está processando o
+    chunk anterior, o novo simplesmente substitui (drop oldest). Isso evita
+    acúmulo de requisições simultâneas e lag crescente de legendas.
+  - _is_busy flag: impede que um segundo requests.post seja disparado enquanto
+    o primeiro ainda não retornou.
+  - config.py lido uma vez via import — API_TRANSCRIBE sempre atualizado.
 """
 
-from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QFont, QColor, QPalette, QCursor
+import queue
+import threading
+
+from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal, QObject, pyqtSlot
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QComboBox, QSizeGrip, QFrame,
+    QLabel, QPushButton, QComboBox, QFrame,
 )
 
 import requests
@@ -23,22 +36,52 @@ from app.audio.device_detector import AudioDevice, CaptureMode, detect_microphon
 from app.config import SUPPORTED_LANGUAGES, API_TRANSCRIBE
 
 
-# ── Worker Thread (requisição ao backend) ─────────────────────────────────────
+# ── Worker Thread ─────────────────────────────────────────────────────────────
 
 class TranscribeWorker(QObject):
     """
-    Envia chunks de áudio ao Spring Boot e emite o resultado.
-    Roda em QThread para não bloquear a UI.
+    Recebe chunks de áudio via signal Qt e os envia ao backend.
+    Roda inteiramente na sua própria QThread — nunca bloqueia a UI nem o áudio.
+
+    Fila de tamanho 1 (substitui o chunk anterior se ainda não processado):
+    mantém as legendas em tempo real sem acumular lag.
     """
-    result_ready = pyqtSignal(str, str)    # (original, translated)
+    result_ready   = pyqtSignal(str, str)   # (original, translated)
     error_occurred = pyqtSignal(str)
+
+    # Signal interno: a thread de áudio deposita o chunk aqui
+    _chunk_received = pyqtSignal(str)
 
     def __init__(self, target_language: str):
         super().__init__()
         self.target_language = target_language
+        self._is_busy = False
+        # Fila de tamanho 1 — sempre processa o chunk mais recente
+        self._pending: str | None = None
+        self._lock = threading.Lock()
+        # Conecta o signal interno ao slot de processamento (mesma thread)
+        self._chunk_received.connect(self._process)
 
-    def transcribe(self, audio_b64: str):
-        """Chamado pela thread — envia áudio ao backend e emite resultado."""
+    def submit(self, audio_b64: str):
+        """
+        Chamado da thread de áudio via signal Qt (thread-safe).
+        Deposita o chunk na fila e dispara processamento se não estiver ocupado.
+        """
+        with self._lock:
+            self._pending = audio_b64   # substitui chunk anterior não processado
+        if not self._is_busy:
+            self._chunk_received.emit(audio_b64)
+
+    @pyqtSlot(str)
+    def _process(self, _audio_b64: str):
+        """Executa na thread do worker — faz o POST ao backend."""
+        with self._lock:
+            audio_b64 = self._pending
+            self._pending = None
+            if audio_b64 is None:
+                return
+
+        self._is_busy = True
         try:
             payload = {
                 "audio": audio_b64,
@@ -47,31 +90,43 @@ class TranscribeWorker(QObject):
             }
             response = requests.post(API_TRANSCRIBE, json=payload, timeout=10)
             response.raise_for_status()
-            data = response.json()
-            original = data.get("original", "")
-            translated = data.get("translated", original)
-            self.result_ready.emit(original, translated)
+            data       = response.json()
+            original   = data.get("original",   "")
+            translated = data.get("translated",  original)
+
+            if original.strip():
+                self.result_ready.emit(original, translated)
+
         except requests.exceptions.ConnectionError:
-            self.error_occurred.emit("Backend offline — iniciando Spring Boot?")
+            self.error_occurred.emit("Backend offline")
         except requests.exceptions.Timeout:
-            self.error_occurred.emit("Timeout ao conectar com o backend.")
+            self.error_occurred.emit("Timeout — backend lento")
         except Exception as e:
             self.error_occurred.emit(f"Erro: {e}")
+        finally:
+            self._is_busy = False
+            # Se chegou um novo chunk enquanto processávamos, dispara imediatamente
+            with self._lock:
+                if self._pending is not None:
+                    self._chunk_received.emit(self._pending)
 
 
 # ── Overlay Window ─────────────────────────────────────────────────────────────
 
 class OverlayWindow(QWidget):
+    # Signal para entregar chunk ao worker de forma thread-safe
+    _audio_ready = pyqtSignal(str)
+
     def __init__(self, device: AudioDevice):
         super().__init__()
-        self._device = device
+        self._device      = device
         self._drag_pos: QPoint | None = None
-        self._is_paused = False
+        self._is_paused   = False
         self._target_lang = "en"
 
         self._capture: AudioCapture | None = None
-        self._worker: TranscribeWorker | None = None
-        self._thread: QThread | None = None
+        self._worker:  TranscribeWorker | None = None
+        self._thread:  QThread | None = None
 
         self._setup_window()
         self._setup_ui()
@@ -83,7 +138,7 @@ class OverlayWindow(QWidget):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool               # não aparece na barra de tarefas
+            | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setMinimumWidth(500)
@@ -140,7 +195,6 @@ class OverlayWindow(QWidget):
             }
         """)
 
-        # Container com fundo — necessário para TranslucentBackground funcionar
         bg = QWidget(self, objectName="bg")
         bg.setGeometry(0, 0, self.width(), self.height())
         self._bg = bg
@@ -149,18 +203,15 @@ class OverlayWindow(QWidget):
         outer.setContentsMargins(16, 10, 16, 10)
         outer.setSpacing(4)
 
-        # ── Barra superior (controles) ────────────────────────────────────────
+        # ── Barra de controles ────────────────────────────────────────────────
         top_bar = QHBoxLayout()
         top_bar.setSpacing(6)
 
-        # Indicador de status
         self._status_label = QLabel("● ouvindo", objectName="status")
         self._status_label.setStyleSheet("color: #3a9e6a; font-size: 11px;")
         top_bar.addWidget(self._status_label)
-
         top_bar.addStretch()
 
-        # Botão alternar fonte de áudio (sistema ↔ microfone)
         self._source_btn = QPushButton("🔊 sistema")
         self._source_btn.setToolTip("Alternar entre áudio do sistema e microfone")
         self._source_btn.setStyleSheet(
@@ -172,7 +223,6 @@ class OverlayWindow(QWidget):
         self._source_btn.clicked.connect(self._toggle_source)
         top_bar.addWidget(self._source_btn)
 
-        # Seletor de idioma alvo
         lang_hint = QLabel("traduzir para:")
         lang_hint.setStyleSheet("color: #555; font-size: 11px;")
         top_bar.addWidget(lang_hint)
@@ -180,19 +230,16 @@ class OverlayWindow(QWidget):
         self._lang_combo = QComboBox()
         for name, code in SUPPORTED_LANGUAGES.items():
             self._lang_combo.addItem(name, code)
-        # Padrão: English
         idx = list(SUPPORTED_LANGUAGES.values()).index("en")
         self._lang_combo.setCurrentIndex(idx)
         self._lang_combo.currentIndexChanged.connect(self._on_language_changed)
         top_bar.addWidget(self._lang_combo)
 
-        # Botão pausa
         self._pause_btn = QPushButton("⏸")
         self._pause_btn.setToolTip("Pausar / Retomar")
         self._pause_btn.clicked.connect(self._toggle_pause)
         top_bar.addWidget(self._pause_btn)
 
-        # Botão fechar
         close_btn = QPushButton("✕")
         close_btn.setToolTip("Fechar")
         close_btn.clicked.connect(self.close)
@@ -200,13 +247,12 @@ class OverlayWindow(QWidget):
 
         outer.addLayout(top_bar)
 
-        # Separador
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("color: rgba(255,255,255,0.06);")
         outer.addWidget(sep)
 
-        # ── Área de legenda ───────────────────────────────────────────────────
+        # ── Área de legendas ──────────────────────────────────────────────────
         self._caption_original = QLabel("", objectName="caption-original")
         self._caption_original.setWordWrap(True)
         self._caption_original.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -223,23 +269,25 @@ class OverlayWindow(QWidget):
     # ── Áudio e backend ───────────────────────────────────────────────────────
 
     def _setup_audio(self):
-        # Worker em thread separada para não bloquear a UI
         self._thread = QThread()
         self._worker = TranscribeWorker(target_language=self._target_lang)
         self._worker.moveToThread(self._thread)
         self._worker.result_ready.connect(self._on_result)
         self._worker.error_occurred.connect(self._on_error)
-        self._thread.start()
 
+        # Conecta o signal da overlay ao submit do worker (cross-thread seguro)
+        self._audio_ready.connect(self._worker.submit)
+
+        self._thread.start()
         self._start_capture(self._device)
 
     def _start_capture(self, device: AudioDevice):
-        """Inicia (ou reinicia) a captura com o dispositivo informado."""
         if self._capture and self._capture.is_running:
             self._capture.stop()
 
         mode_label = "sistema" if device.mode == CaptureMode.SYSTEM else "microfone"
-        self._source_btn.setText(f"{'🔊' if device.mode == CaptureMode.SYSTEM else '🎤'} {mode_label}")
+        icon       = "🔊" if device.mode == CaptureMode.SYSTEM else "🎤"
+        self._source_btn.setText(f"{icon} {mode_label}")
 
         self._capture = AudioCapture(device=device, on_chunk=self._on_audio_chunk)
         try:
@@ -250,7 +298,6 @@ class OverlayWindow(QWidget):
             self._caption_main.setText(f"Erro ao abrir dispositivo: {e}")
 
     def _toggle_source(self):
-        """Alterna entre áudio do sistema e microfone."""
         if self._device.mode == CaptureMode.SYSTEM:
             mic = detect_microphone()
             if mic:
@@ -259,8 +306,7 @@ class OverlayWindow(QWidget):
             else:
                 self._caption_main.setText("Nenhum microfone encontrado.")
         else:
-            # Volta para o dispositivo de sistema original
-            from audio.device_detector import detect_system_audio
+            from app.audio.device_detector import detect_system_audio
             sys_dev = detect_system_audio()
             if sys_dev:
                 self._device = sys_dev
@@ -269,27 +315,36 @@ class OverlayWindow(QWidget):
                 self._caption_main.setText("Dispositivo de sistema não encontrado.")
 
     def _on_audio_chunk(self, audio_b64: str):
-        """Chamado pela thread de áudio — repassa ao worker via Qt signal."""
+        """
+        Chamado pela thread de áudio (pyaudiowpatch callback).
+        Emite signal Qt — entrega ao worker de forma thread-safe e retorna
+        imediatamente, sem bloquear o callback de áudio.
+        """
         if not self._is_paused:
-            # Invoke na thread do worker (thread-safe)
-            self._worker.transcribe(audio_b64)
+            self._audio_ready.emit(audio_b64)
 
-    # ── Slots ─────────────────────────────────────────────────────────────────
+    # ── Slots de resultado ────────────────────────────────────────────────────
 
+    @pyqtSlot(str, str)
     def _on_result(self, original: str, translated: str):
-        if not original.strip():
-            return
-        show_original = original != translated
+        show_original = original.strip() != translated.strip()
         if show_original:
             self._caption_original.setText(original)
             self._caption_original.show()
         else:
             self._caption_original.hide()
+
+        self._caption_main.setStyleSheet(
+            "color: #ffffff; font-size: 22px; font-weight: 500; font-family: sans-serif;"
+        )
         self._caption_main.setText(translated)
 
+    @pyqtSlot(str)
     def _on_error(self, msg: str):
+        self._caption_main.setStyleSheet(
+            "color: #e05a5a; font-size: 14px; font-family: sans-serif;"
+        )
         self._caption_main.setText(msg)
-        self._caption_main.setStyleSheet("color: #e05a5a; font-size: 16px;")
 
     def _on_language_changed(self, idx: int):
         self._target_lang = self._lang_combo.currentData()
@@ -315,7 +370,7 @@ class OverlayWindow(QWidget):
         self._status_label.setText(text)
         self._status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
 
-    # ── Drag para mover a janela ───────────────────────────────────────────────
+    # ── Drag ──────────────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -328,17 +383,15 @@ class OverlayWindow(QWidget):
     def mouseReleaseEvent(self, event):
         self._drag_pos = None
 
-    # ── Resize: bg acompanha o tamanho da janela ───────────────────────────────
-
     def resizeEvent(self, event):
         self._bg.setGeometry(0, 0, self.width(), self.height())
 
-    # ── Limpeza ao fechar ─────────────────────────────────────────────────────
+    # ── Limpeza ───────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
         if self._capture:
             self._capture.stop()
         if self._thread:
             self._thread.quit()
-            self._thread.wait()
+            self._thread.wait(3000)
         event.accept()

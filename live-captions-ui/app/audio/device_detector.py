@@ -10,6 +10,14 @@ macOS:   usa sounddevice + BlackHole (driver virtual gratuito).
 Dois modos:
   SYSTEM     → áudio do sistema (YouTube, Meet, qualquer app)
   MICROPHONE → microfone (feature futura — detectado mas não usado por padrão)
+
+CORREÇÕES aplicadas:
+  - Cap de canais: WASAPI loopback reporta valores brutos (0, 18, 32, …) que
+    o driver não aceita ao abrir o stream. Normalizado para max(1, min(ch, 2)).
+  - Log diagnóstico: todos os loopbacks disponíveis são logados na inicialização
+    para facilitar troubleshooting.
+  - Fallback robusto: quando nenhum loopback tem nome correspondente à saída
+    padrão, usa o primeiro disponível sem silenciar o erro.
 """
 
 import logging
@@ -37,7 +45,18 @@ class AudioDevice:
 
     def __str__(self):
         tag = "sistema" if self.mode == CaptureMode.SYSTEM else "microfone"
-        return f"{self.name} [{tag}, {self.native_sample_rate}Hz]"
+        return f"{self.name} [{tag}, {self.native_sample_rate}Hz, {self.channels}ch]"
+
+
+def _safe_channels(raw: int, max_ch: int = 2) -> int:
+    """
+    Normaliza o número de canais reportado pelo hardware.
+
+    WASAPI loopback pode reportar 0 (dispositivo silencioso/desconectado)
+    ou valores altos (18, 32) que o driver recusa ao abrir o InputStream.
+    Garantimos sempre 1 ≤ channels ≤ max_ch.
+    """
+    return max(1, min(int(raw), max_ch))
 
 
 # ── API pública ────────────────────────────────────────────────────────────────
@@ -64,7 +83,7 @@ def detect_microphone() -> Optional[AudioDevice]:
         return AudioDevice(
             index=default_idx,
             name=dev["name"],
-            channels=min(int(dev["max_input_channels"]), 2),
+            channels=_safe_channels(dev["max_input_channels"]),
             native_sample_rate=int(dev.get("default_samplerate", 48000)),
             mode=CaptureMode.MICROPHONE,
             is_loopback=False,
@@ -93,7 +112,7 @@ def list_microphone_devices() -> list[AudioDevice]:
             AudioDevice(
                 index=i,
                 name=dev["name"],
-                channels=min(int(dev["max_input_channels"]), 2),
+                channels=_safe_channels(dev["max_input_channels"]),
                 native_sample_rate=int(dev.get("default_samplerate", 48000)),
                 mode=CaptureMode.MICROPHONE,
                 is_loopback=False,
@@ -112,8 +131,8 @@ def _detect_windows_loopback() -> Optional[AudioDevice]:
     Usa pyaudiowpatch para encontrar o dispositivo de loopback
     correspondente à saída padrão do sistema (fones, alto-falantes).
 
-    pyaudiowpatch expõe dispositivos de loopback como entradas virtuais —
-    não é necessário nenhuma configuração extra no Windows.
+    Correção: _safe_channels() garante que channels nunca seja 0 nem > 2,
+    evitando o PaErrorCode -9998 (Invalid number of channels) ao abrir o stream.
     """
     try:
         import pyaudiowpatch as pyaudio
@@ -126,41 +145,59 @@ def _detect_windows_loopback() -> Optional[AudioDevice]:
 
     p = pyaudio.PyAudio()
     try:
-        # Informações da API WASAPI
         wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
         default_out_idx = wasapi_info["defaultOutputDevice"]
         default_out     = p.get_device_info_by_index(default_out_idx)
 
-        logger.info(f"[Detector] Saída padrão: {default_out['name']}")
+        logger.info(f"[Detector] Saída padrão do sistema: '{default_out['name']}'")
 
-        # pyaudiowpatch já expõe dispositivos de loopback separados
-        # Procura o loopback que corresponde à saída padrão
-        for loopback in p.get_loopback_device_info_generator():
-            if default_out["name"] in loopback["name"]:
-                logger.info(f"[Detector] Loopback encontrado: {loopback['name']}")
+        # Log diagnóstico — lista todos os loopbacks antes de escolher
+        all_loopbacks = list(p.get_loopback_device_info_generator())
+        if not all_loopbacks:
+            logger.warning("[Detector] Nenhum dispositivo de loopback encontrado pelo pyaudiowpatch.")
+            logger.warning(
+                "[Detector] Verifique se o áudio do sistema está ativo e se "
+                "pyaudiowpatch está instalado corretamente."
+            )
+            return None
+
+        logger.info(f"[Detector] {len(all_loopbacks)} loopback(s) disponível(is):")
+        for lb in all_loopbacks:
+            raw_ch = int(lb["maxInputChannels"])
+            safe_ch = _safe_channels(raw_ch)
+            logger.info(
+                f"  [{int(lb['index'])}] '{lb['name']}' "
+                f"| canais brutos={raw_ch} → usará {safe_ch} "
+                f"| rate={int(lb['defaultSampleRate'])}Hz"
+            )
+
+        # Tenta corresponder ao dispositivo de saída padrão
+        for lb in all_loopbacks:
+            if default_out["name"] in lb["name"]:
+                logger.info(f"[Detector] Loopback selecionado (match): '{lb['name']}'")
                 return AudioDevice(
-                    index=int(loopback["index"]),
-                    name=loopback["name"],
-                    channels=int(loopback["maxInputChannels"]),   # valor exato — não capar
-                    native_sample_rate=int(loopback["defaultSampleRate"]),
+                    index=int(lb["index"]),
+                    name=lb["name"],
+                    channels=_safe_channels(lb["maxInputChannels"]),
+                    native_sample_rate=int(lb["defaultSampleRate"]),
                     mode=CaptureMode.SYSTEM,
                     is_loopback=True,
                 )
 
         # Fallback: primeiro loopback disponível
-        for loopback in p.get_loopback_device_info_generator():
-            logger.info(f"[Detector] Usando primeiro loopback: {loopback['name']}")
-            return AudioDevice(
-                index=int(loopback["index"]),
-                name=loopback["name"],
-                channels=int(loopback["maxInputChannels"]),   # valor exato — não capar
-                native_sample_rate=int(loopback["defaultSampleRate"]),
-                mode=CaptureMode.SYSTEM,
-                is_loopback=True,
-            )
-
-        logger.warning("[Detector] Nenhum dispositivo de loopback encontrado")
-        return None
+        lb = all_loopbacks[0]
+        logger.warning(
+            f"[Detector] Nenhum loopback corresponde à saída padrão. "
+            f"Usando fallback: '{lb['name']}'"
+        )
+        return AudioDevice(
+            index=int(lb["index"]),
+            name=lb["name"],
+            channels=_safe_channels(lb["maxInputChannels"]),
+            native_sample_rate=int(lb["defaultSampleRate"]),
+            mode=CaptureMode.SYSTEM,
+            is_loopback=True,
+        )
 
     except Exception as e:
         logger.error(f"[Detector] Erro ao detectar loopback: {e}")
@@ -179,12 +216,12 @@ def _list_windows_loopback_devices() -> list[AudioDevice]:
     p = pyaudio.PyAudio()
     result = []
     try:
-        for loopback in p.get_loopback_device_info_generator():
+        for lb in p.get_loopback_device_info_generator():
             result.append(AudioDevice(
-                index=int(loopback["index"]),
-                name=loopback["name"],
-                channels=int(loopback["maxInputChannels"]),   # valor exato
-                native_sample_rate=int(loopback["defaultSampleRate"]),
+                index=int(lb["index"]),
+                name=lb["name"],
+                channels=_safe_channels(lb["maxInputChannels"]),
+                native_sample_rate=int(lb["defaultSampleRate"]),
                 mode=CaptureMode.SYSTEM,
                 is_loopback=True,
             ))
@@ -206,7 +243,7 @@ def _detect_macos_blackhole() -> Optional[AudioDevice]:
                 return AudioDevice(
                     index=i,
                     name=dev["name"],
-                    channels=min(int(dev["max_input_channels"]), 2),
+                    channels=_safe_channels(dev["max_input_channels"]),
                     native_sample_rate=int(dev.get("default_samplerate", 48000)),
                     mode=CaptureMode.SYSTEM,
                     is_loopback=False,
@@ -224,7 +261,7 @@ def _list_macos_blackhole_devices() -> list[AudioDevice]:
             AudioDevice(
                 index=i,
                 name=dev["name"],
-                channels=min(int(dev["max_input_channels"]), 2),
+                channels=_safe_channels(dev["max_input_channels"]),
                 native_sample_rate=int(dev.get("default_samplerate", 48000)),
                 mode=CaptureMode.SYSTEM,
                 is_loopback=False,
