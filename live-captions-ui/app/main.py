@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QIcon
 from PyQt6.QtCore import Qt
 
-from audio.device_detector import detect_system_audio, AudioDevice
+from app.audio.device_detector import detect_system_audio, AudioDevice
 from ui.onboarding import OnboardingWindow
 from ui.overlay import OverlayWindow
 from config import APP_NAME, APP_VERSION
