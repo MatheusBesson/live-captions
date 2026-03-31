@@ -62,6 +62,9 @@ class TranscribeWorker(QObject):
 # ── Overlay Window ─────────────────────────────────────────────────────────────
 
 class OverlayWindow(QWidget):
+    # Signal thread-safe: thread de áudio → worker Qt
+    _audio_ready = pyqtSignal(str)
+
     def __init__(self, device: AudioDevice):
         super().__init__()
         self._device = device
@@ -223,14 +226,14 @@ class OverlayWindow(QWidget):
     # ── Áudio e backend ───────────────────────────────────────────────────────
 
     def _setup_audio(self):
-        # Worker em thread separada para não bloquear a UI
         self._thread = QThread()
         self._worker = TranscribeWorker(target_language=self._target_lang)
         self._worker.moveToThread(self._thread)
         self._worker.result_ready.connect(self._on_result)
         self._worker.error_occurred.connect(self._on_error)
+        # Signal cross-thread: áudio → worker
+        self._audio_ready.connect(self._worker.transcribe)
         self._thread.start()
-
         self._start_capture(self._device)
 
     def _start_capture(self, device: AudioDevice):
@@ -267,10 +270,9 @@ class OverlayWindow(QWidget):
                 self._caption_main.setText("Dispositivo de sistema não encontrado.")
 
     def _on_audio_chunk(self, audio_b64: str):
-        """Chamado pela thread de áudio — repassa ao worker via Qt signal."""
+        """Chamado pela thread de áudio — usa signal Qt para thread safety."""
         if not self._is_paused:
-            # Invoke na thread do worker (thread-safe)
-            self._worker.transcribe(audio_b64)
+            self._audio_ready.emit(audio_b64)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 
